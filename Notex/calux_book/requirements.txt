@@ -1,0 +1,30 @@
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+pydantic>=2.10.0
+pydantic-settings>=2.7.0
+aiosqlite>=0.20.0
+python-dotenv>=1.0.0
+python-jose[cryptography]>=3.3.0
+python-multipart>=0.0.18
+httpx>=0.28.0
+openai>=1.60.0
+google-genai>=1.5.0
+
+# Parser Router
+python-docx>=1.1.0
+python-calamine>=0.3.0
+rapidocr>=3.0.0
+pypdfium2>=4.0.0
+Pillow>=10.0.0
+
+# Embedding & Vector Store
+fastembed>=0.5.0
+lancedb>=0.17.0
+pyarrow>=15.0.0
+numpy>=1.26.0
+tantivy>=0.22.0
+
+# Development / Testing
+pytest>=8.0
+pytest-asyncio>=0.25.0
+coverage>=7.0

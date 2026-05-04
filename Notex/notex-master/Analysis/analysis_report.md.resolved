@@ -1,0 +1,79 @@
+# Notex Codebase Analysis Report
+
+Based on a detailed review of the `f:\Startup\notex-master\Notex\notex-master` repository, here is the analysis covering the key aspects you requested:
+
+## 1. Architectural Overview
+
+Notex operates on a monolithic **Client-Server Architecture**, bundled elegantly into a single executable.
+
+### The Backend
+- **Framework**: Written in Go using the `gin-gonic/gin` HTTP web framework.
+- **Routing & API**: The [server.go](file:///f:/Startup/notex-master/Notex/notex-master/backend/server.go) file dictates the routing. The backend exposes standard REST API endpoints (e.g., `/api/notebooks`, `/api/upload`, `/api/notebooks/:id/chat`) protected via JWT-based authentication middleware. 
+- **Relational Storage**: Core application metadata (Users, Notebooks, Sources metadata, Notes, Chat sessions, Activity logs) is stored in a **SQLite** database ([store.go](file:///f:/Startup/notex-master/Notex/notex-master/backend/store.go)).
+- **Agent Integration**: Centralized in [agent.go](file:///f:/Startup/notex-master/Notex/notex-master/backend/agent.go), the backend utilizes the `langchaingo` library to interface robustly with local (Ollama) and remote (OpenAI, Gemini) LLM providers.
+
+### The Frontend
+- **Design**: It is a Vanilla Single Page Application (SPA) driven by local JavaScript ([app.js](file:///f:/Startup/notex-master/Notex/notex-master/backend/frontend/static/app.js)) and CSS ([style.css](file:///f:/Startup/notex-master/Notex/notex-master/backend/frontend/static/style.css)), residing within the `backend/frontend` directory.
+- **Delivery**: To simplify distribution, the entire `frontend` directory is deeply embedded into the Go binary at compile time using Go's `//go:embed` directive. Gin handles serving these static files via native `http.FS`.
+
+### Diagram Reference (Interaction Flow)
+```mermaid
+flowchart TD
+    Client[Browser Frontend - app.js] <-->|JSON REST API| Server[Go Gin Server - server.go]
+    Server <-->|SQL Queries| DB[(SQLite Database - store.go)]
+    Server <-->|Trigger Upload / Indexing| Parser[Vector Store & Parser - vector.go]
+    Parser <-->|Sub-process| Markitdown[Python Markitdown CLI]
+    Server <-->|RAG Prompts & Context| Agent[LLM Agent - agent.go]
+    Agent <-->|API Calls| LLM[Local Ollama / Remote OpenAI]
+```
+
+---
+
+## 2. Document Parsing, Chunking & Storage
+
+The document pipeline is managed entirely within [backend/vector.go](file:///f:/Startup/notex-master/Notex/notex-master/backend/vector.go).
+
+### Parsing
+- **Plain Text**: Simple `.txt` or [.md](file:///f:/Startup/notex-master/Notex/notex-master/README.md) files are read directly into memory. 
+- **Complex Formats (PDF, DOCX, PPTX, XLSX)**: Instead of utilizing native Go libraries, the platform makes system calls (`os/exec`) to an external Python CLI tool called `markitdown`. This tool extracts and normalizes the contents of the given rich document formats into Markdown. 
+  *(Note: This means the host running the app must have Python and `markitdown` installed for ingestion to function properly).*
+
+### Chunking Logic
+The [splitText()](file:///f:/Startup/notex-master/Notex/notex-master/backend/vector.go#142-214) function governs how extracted text is divided:
+1. **Language Detection**: The codebase samples the first 1000 characters to determine the proportion of CJK (Chinese, Japanese, Korean) characters. 
+2. **Strategy**:
+   - **Western Text (< 30% CJK)**: Splits strictly based on word boundaries using `strings.Fields()`.
+   - **CJK Text (> 30% CJK)**: Splits by raw character length (`rune` count), given that Eastern languages don't rely uniformly on spaces.
+3. **Sizing**: Default size is `1000` units (words or runes depending on the strategy above), with an overlap of `200` to prevent lost context at chunk boundaries.
+
+### Storage
+Interestingly, despite the codebase referring to a [VectorStore](file:///f:/Startup/notex-master/Notex/notex-master/backend/vector.go#22-30), **there is no formal Vector Database (like Qdrant or Milvus)**. 
+- Text chunks are parsed into `schema.Document` structs and stored completely in the application's **Runtime RAM** (`vs.docs` slice). 
+- When a user interacts with a notebook, the application lazy-loads the chunks from the database into process memory. To prevent duplicate loads, it hashes the content (SHA-256 fingerprinting).
+
+---
+
+## 3. Retrieval Technology & LLM Inferencing Workflow
+
+### Retrieval Technology (In-Memory Hybrid Keyword Search)
+Because chunks are stored in RAM rather than an embedding-based vector database, semantic vector search is not utilized by default. Instead, [SimilaritySearch()](file:///f:/Startup/notex-master/Notex/notex-master/backend/vector.go#215-383) performs an advanced **In-Memory Hybrid Statistical Search**. 
+For any given query, the system loops over all chunks tied to the current Notebook and assigns a `hybridScore` based on:
+1. **BM25 Algorithm (55% weight)**: Tests Term Frequency-Inverse Document Frequency.
+2. **Fuzzy Matching (30% weight)**: Calculates the Jaccard Similarity of character trigrams (3-grams) to catch typos and closely spelled words.
+3. **Lexical Scoring (15% weight)**: Boosts the score heavily if the exact query substring is matched, and slightly boosts based on individual character intersections.
+
+### LLM Inferencing Workflow (RAG)
+The inference workflow orchestrated in [agent.go](file:///f:/Startup/notex-master/Notex/notex-master/backend/agent.go) operates as follows:
+1. **User Request**: The user submits a prompt via the chat UI.
+2. **Retrieval**: The [Chat()](file:///f:/Startup/notex-master/Notex/notex-master/backend/agent.go#160-257) method invokes the hybrid [SimilaritySearch()](file:///f:/Startup/notex-master/Notex/notex-master/backend/vector.go#215-383) to grab the top-K relevant chunks, filtering them intelligently to ensure source diversity (preventing one massive document from hogging all results).
+3. **Context Packing**: The [packRetrievedContext()](file:///f:/Startup/notex-master/Notex/notex-master/backend/agent.go#258-299) function concatenates these chunks into a clean formatting string, deliberately truncating the context if its size eclipses the configured `MaxContextLength` (to avoid token overflow).
+4. **History Merging**: Up to the 10 most recent chat messages from the SQLite database are fetched to form a conversational short-term memory block.
+5. **Prompt Formatting**: The history, packed context, and current user question are interpolated into a final system-level RAG prompt.
+6. **Execution**: The compiled prompt is sent through `langchaingo`'s `GenerateFromSinglePrompt` wrapper to the configured LLM endpoint (e.g., local Ollama or OpenAI GPT-4o-mini), fetching the result and mapping it to the referenced Source IDs for UI citations. 
+
+---
+
+### Areas for Future Optimization (Takeaways)
+- **Vector Embeddings**: Since retrieval currently relies *only* on exact/fuzzy keyword matches (BM25), the bot might struggle with semantic meaning (e.g., missing documents if the user searches for "automobile" but the document says "car"). Introducing genuine embeddings (and a lightweight vector SQLite extension like `sqlite-vss`) would drastically upgrade accuracy.
+- **Memory Consumption**: Loading huge notebooks directly into Go RAM slices (`vs.docs`) will eventually bottleneck hosting environments if user count scales.
+- **Parsing Dependency**: The reliance on the external `markitdown` Python CLI creates a disjointed deployment dependency. Implementing native Go PDF/DOCX parsers would streamline environments.

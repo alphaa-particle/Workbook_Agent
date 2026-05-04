@@ -1,0 +1,45 @@
+# Environment and local overrides
+.env
+.env.local
+.env.*.local
+
+# Build outputs
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.out
+*.test
+notex
+dist/
+bin/
+tmp/
+
+# Go workspace files
+go.work
+go.work.sum
+
+# Coverage and profiling
+coverage.*
+*.coverprofile
+profile.cov
+
+# Runtime data
+data/
+uploads/
+logs/
+server.log
+*.db
+*.sqlite
+*.sqlite3
+
+# Editor and OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Tooling caches
+.claude/
+.baidu-cc/

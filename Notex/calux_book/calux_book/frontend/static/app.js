@@ -1,0 +1,2740 @@
+// LocalCache - 本地缓存管理类
+class LocalCache {
+    constructor(ttlMinutes = 5) {
+        this.ttl = ttlMinutes * 60 * 1000; // 转换为毫秒
+        this.prefix = 'calux_book_cache_';
+    }
+
+    // 生成缓存键
+    _makeKey(key) {
+        return `${this.prefix}${key}`;
+    }
+
+    // 获取缓存
+    get(key) {
+        try {
+            const fullKey = this._makeKey(key);
+            const item = localStorage.getItem(fullKey);
+            if (!item) return null;
+
+            const data = JSON.parse(item);
+
+            // 检查是否过期
+            if (Date.now() > data.expiresAt) {
+                localStorage.removeItem(fullKey);
+                return null;
+            }
+
+            return data.value;
+        } catch (e) {
+            console.warn('Cache get error:', e);
+            return null;
+        }
+    }
+
+    // 设置缓存
+    set(key, value, customTTL = null) {
+        try {
+            const fullKey = this._makeKey(key);
+            const ttl = customTTL || this.ttl;
+            const data = {
+                value,
+                expiresAt: Date.now() + ttl
+            };
+            localStorage.setItem(fullKey, JSON.stringify(data));
+        } catch (e) {
+            console.warn('Cache set error:', e);
+        }
+    }
+
+    // 删除缓存
+    delete(key) {
+        try {
+            const fullKey = this._makeKey(key);
+            localStorage.removeItem(fullKey);
+        } catch (e) {
+            console.warn('Cache delete error:', e);
+        }
+    }
+
+    // 按前缀删除缓存
+    deletePattern(pattern) {
+        try {
+            const prefix = this._makeKey(pattern);
+            const keys = [];
+            for (let i = 0; i < localStorage.length; i++) {
+                const key = localStorage.key(i);
+                if (key && key.startsWith(prefix)) {
+                    keys.push(key);
+                }
+            }
+            keys.forEach(key => localStorage.removeItem(key));
+        } catch (e) {
+            console.warn('Cache deletePattern error:', e);
+        }
+    }
+
+    // 清空所有缓存
+    clear() {
+        try {
+            const keys = [];
+            for (let i = 0; i < localStorage.length; i++) {
+                const key = localStorage.key(i);
+                if (key && key.startsWith(this.prefix)) {
+                    keys.push(key);
+                }
+            }
+            keys.forEach(key => localStorage.removeItem(key));
+        } catch (e) {
+            console.warn('Cache clear error:', e);
+        }
+    }
+
+    // 清理过期缓存
+    cleanup() {
+        try {
+            const now = Date.now();
+            const keys = [];
+            for (let i = 0; i < localStorage.length; i++) {
+                const key = localStorage.key(i);
+                if (key && key.startsWith(this.prefix)) {
+                    keys.push(key);
+                }
+            }
+            keys.forEach(key => {
+                try {
+                    const item = localStorage.getItem(key);
+                    if (item) {
+                        const data = JSON.parse(item);
+                        if (now > data.expiresAt) {
+                            localStorage.removeItem(key);
+                        }
+                    }
+                } catch (e) {
+                    // 忽略解析错误，删除无效条目
+                    localStorage.removeItem(key);
+                }
+            });
+        } catch (e) {
+            console.warn('Cache cleanup error:', e);
+        }
+    }
+}
+
+class OpenNotebook {
+    constructor() {
+        this.notebooks = [];
+        this.currentNotebook = null;
+        this.apiBase = '/api';
+        this.currentChatSession = null;
+        this.currentPublicToken = null;
+
+        // Auth state
+        this.token = localStorage.getItem('token');
+        this.currentUser = null;
+
+        // Source status polling
+        this._statusPollTimer = null;
+        this._statusPollInterval = 2000; // 2 seconds
+
+        // Sync token from localStorage to cookie for image loading
+        if (this.token) {
+            document.cookie = `token=${this.token}; path=/; SameSite=Lax`;
+        }
+
+        // 初始化本地缓存 (5分钟TTL)
+        this.cache = new LocalCache(5);
+
+        // Note type name mapping
+        this.noteTypeNameMap = {
+            summary: 'Summary'
+        };
+
+        this.init();
+    }
+
+    async init() {
+        await this.initAuth();
+        await this.loadConfig();
+        this.bindEvents();
+        this.initResizers();
+        this.initNotebookNameEditor();
+
+        // 清理过期缓存
+        this.cache.cleanup();
+
+        // Check if URL contains /notes/:id or /public/:token for direct notebook access
+        // Only load notebooks if not accessing a public notebook directly
+        if (!this.checkURLForNotebook() && !this.checkURLForPublicNotebook()) {
+            await this.loadNotebooks();
+            this.applyConfig();
+            this.switchView('landing');
+        } else {
+            this.applyConfig();
+        }
+    }
+
+    // Check if URL contains /public/:token and load the public notebook
+    checkURLForPublicNotebook() {
+        const path = window.location.pathname;
+        const match = path.match(/^\/public\/([a-f0-9-]+)$/);
+        if (match) {
+            this.loadPublicNotebook(match[1]);
+            return true;
+        }
+        return false;
+    }
+
+    // Load public notebook by token
+    async loadPublicNotebook(token) {
+        try {
+            this.setStatus('Loading public notebook...');
+
+            const [notebook, sources, notes] = await Promise.all([
+                fetch(`/public/notebooks/${token}`).then(r => {
+                    if (!r.ok) throw new Error('Failed to load notebook');
+                    return r.json();
+                }),
+                fetch(`/public/notebooks/${token}/sources`).then(r => {
+                    if (!r.ok) throw new Error('Failed to load sources');
+                    return r.json();
+                }),
+                fetch(`/public/notebooks/${token}/notes`).then(r => {
+                    if (!r.ok) throw new Error('Failed to load notes');
+                    return r.json();
+                })
+            ]);
+
+            this.currentNotebook = notebook;
+            this.currentPublicToken = token;
+
+            // 先显示笔记列表 tab（创建容器）
+            this.showNotesListTab();
+
+            // 渲染 sources
+            await this.renderSourcesList(sources);
+
+            // 渲染 notes 到紧凑网格视图（容器已创建）
+            await this.renderNotesCompactGridPublic(notes);
+
+            // 设置为只读模式
+            this.setReadOnlyMode(true);
+
+            this.switchView('workspace');
+            this.setStatus('Public notebook: ' + notebook.name);
+        } catch (error) {
+            console.error('Failed to load public notebook:', error);
+            this.showError('Failed to load public notebook');
+            this.switchView('landing');
+        }
+    }
+
+    // Handle back to list button click
+    async handleBackToList() {
+        // Stop any active status polling
+        this._stopStatusPolling();
+
+        // Reset readonly mode if leaving a public notebook
+        this.setReadOnlyMode(false);
+
+        // Clear public notebook state
+        this.currentPublicToken = null;
+        this.currentNotebook = null;
+
+        // Reload user's notebooks
+        await this.loadNotebooks();
+
+        // Clear status
+        this.setStatus('Ready');
+
+        // Switch to landing view
+        this.switchView('landing');
+    }
+
+    // 设置只读模式
+    setReadOnlyMode(readOnly) {
+        const workspace = document.getElementById('workspaceContainer');
+        if (readOnly) {
+            workspace.classList.add('readonly-mode');
+            // 禁用编辑功能
+            const addSourceBtn = document.getElementById('btnAddSource');
+            if (addSourceBtn) addSourceBtn.style.display = 'none';
+
+            // Hide summary button
+            const summaryBtn = document.getElementById('btnSummaryFloat');
+            if (summaryBtn) summaryBtn.style.display = 'none';
+
+            // 隐藏聊天功能
+            const chatWrapper = document.querySelector('.chat-messages-wrapper');
+            if (chatWrapper) chatWrapper.style.display = 'none';
+            const chatInput = document.querySelector('.chat-input-wrapper');
+            if (chatInput) chatInput.style.display = 'none';
+
+            // 显示公开标识
+            this.showPublicBadge();
+        } else {
+            workspace.classList.remove('readonly-mode');
+            const addSourceBtn = document.getElementById('btnAddSource');
+            if (addSourceBtn) addSourceBtn.style.display = '';
+
+            const summaryBtn = document.getElementById('btnSummaryFloat');
+            if (summaryBtn) summaryBtn.style.display = '';
+
+            const chatWrapper = document.querySelector('.chat-messages-wrapper');
+            if (chatWrapper) chatWrapper.style.display = '';
+
+            const chatInput = document.querySelector('.chat-input-wrapper');
+            if (chatInput) chatInput.style.display = '';
+
+            const badge = document.querySelector('.public-badge');
+            if (badge) badge.remove();
+        }
+    }
+
+    // 显示公开标识
+    showPublicBadge() {
+        // 移除已存在的 badge
+        const existingBadge = document.querySelector('.public-badge');
+        if (existingBadge) existingBadge.remove();
+
+        const nameDisplay = document.getElementById('currentNotebookName');
+        if (nameDisplay && !document.querySelector('.public-badge')) {
+            const badge = document.createElement('div');
+            badge.className = 'public-badge';
+            badge.innerHTML = `
+                <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M5 9l2-2 2 2m-4 0l2-2 2-2"/>
+                </svg>
+                <span>Public</span>
+            `;
+            nameDisplay.parentNode.appendChild(badge);
+        }
+    }
+
+    // Check if URL contains /notes/:id and auto-load the notebook
+    // Returns true if a notebook was found and loaded, false otherwise
+    checkURLForNotebook() {
+        const path = window.location.pathname;
+        const match = path.match(/^\/notes\/([a-f0-9-]+)$/);
+        if (match) {
+            const notebookId = match[1];
+            // Check if notebook exists in loaded notebooks
+            const notebook = this.notebooks.find(nb => nb.id === notebookId);
+            if (notebook) {
+                this.selectNotebook(notebookId);
+                return true;  // Notebook found and loaded
+            } else {
+                // Notebook not found or user doesn't have access
+                this.setStatus('Notebook not found or access denied', true);
+                return false;  // Notebook not found
+            }
+        }
+        return false;  // No notebook ID in URL
+    }
+
+    // Update URL when notebook is selected
+    updateURL(notebookId) {
+        const newURL = `/notes/${notebookId}`;
+        window.history.pushState({ notebookId }, '', newURL);
+    }
+
+    async loadConfig() {
+        // Config loading - no longer needed, all features enabled
+    }
+
+    applyConfig() {
+        // All features enabled by default, no config to apply
+    }
+
+    initResizers() {
+        const resizerLeft = document.getElementById('resizerLeft');
+        const resizerRight = document.getElementById('resizerRight');
+        const grid = document.querySelector('.main-grid');
+
+        if (!resizerLeft || !resizerRight) return;
+
+        let isDragging = false;
+        let currentResizer = null;
+
+        const startDragging = (e, resizer) => {
+            isDragging = true;
+            currentResizer = resizer;
+            resizer.classList.add('dragging');
+            document.body.style.cursor = 'col-resize';
+            e.preventDefault();
+        };
+
+        const stopDragging = () => {
+            if (!isDragging) return;
+            isDragging = false;
+            currentResizer.classList.remove('dragging');
+            document.body.style.cursor = '';
+            currentResizer = null;
+        };
+
+        const drag = (e) => {
+            if (!isDragging) return;
+
+            const gridRect = grid.getBoundingClientRect();
+            if (currentResizer === resizerLeft) {
+                const width = e.clientX - gridRect.left;
+                if (width > 150 && width < 600) {
+                    grid.style.setProperty('--left-width', `${width}px`);
+                }
+            } else if (currentResizer === resizerRight) {
+                const width = gridRect.right - e.clientX;
+                if (width > 200 && width < 600) {
+                    grid.style.setProperty('--right-width', `${width}px`);
+                }
+            }
+        };
+
+        resizerLeft.addEventListener('mousedown', (e) => startDragging(e, resizerLeft));
+        resizerRight.addEventListener('mousedown', (e) => startDragging(e, resizerRight));
+        document.addEventListener('mousemove', drag);
+        document.addEventListener('mouseup', stopDragging);
+    }
+
+    bindEvents() {
+        const safeAddEventListener = (id, event, handler) => {
+            const el = document.getElementById(id);
+            if (el) el.addEventListener(event, handler);
+        };
+
+        safeAddEventListener('btnNewNotebook', 'click', () => this.showNewNotebookModal());
+        safeAddEventListener('btnNewNotebookLanding', 'click', () => this.showNewNotebookModal());
+        safeAddEventListener('btnShareNotebook', 'click', () => {
+            if (this.currentNotebook) {
+                this.showShareDialog(this.currentNotebook);
+            }
+        });
+
+        // Share modal events
+        safeAddEventListener('btnCloseShareModal', 'click', () => this.closeShareModal());
+        safeAddEventListener('btnCancelShare', 'click', () => this.closeShareModal());
+        safeAddEventListener('btnCopyLink', 'click', () => this.copyShareLink());
+        safeAddEventListener('btnToggleShare', 'click', () => this.toggleShareFromModal());
+
+        // Auth events
+        safeAddEventListener('btnLogin', 'click', () => this.handleLogin());
+        safeAddEventListener('btnLogout', 'click', () => this.handleLogout());
+        safeAddEventListener('btnLoginWorkspace', 'click', () => this.handleLogin());
+        safeAddEventListener('btnLogoutWorkspace', 'click', () => this.handleLogout());
+
+        safeAddEventListener('btnBackToList', 'click', () => this.handleBackToList());
+        safeAddEventListener('btnToggleRight', 'click', () => this.toggleRightPanel());
+        safeAddEventListener('btnToggleLeft', 'click', () => this.toggleLeftPanel());
+        safeAddEventListener('btnShowNotesDetails', 'click', () => this.showNotesListTab());
+        safeAddEventListener('btnCloseNotesList', 'click', (e) => {
+            e.stopPropagation();
+            this.closeNotesListTab();
+        });
+        safeAddEventListener('btnCloseNote', 'click', (e) => {
+            e.stopPropagation();
+            this.closeNoteTab();
+        });
+
+        // Panel tabs
+        document.querySelectorAll('.tab-btn').forEach(tab => {
+            tab.addEventListener('click', () => {
+                this.switchPanelTab(tab.dataset.tab);
+            });
+        });
+        
+        safeAddEventListener('newNotebookForm', 'submit', (e) => this.handleCreateNotebook(e));
+        safeAddEventListener('btnCloseNotebookModal', 'click', () => this.closeModals());
+        safeAddEventListener('btnCancelNotebook', 'click', () => this.closeModals());
+
+        safeAddEventListener('btnAddSource', 'click', () => this.showAddSourceModal());
+        safeAddEventListener('btnCloseSourceModal', 'click', () => this.closeModals());
+        const dropZone = document.getElementById('dropZone');
+        if (dropZone) {
+            dropZone.addEventListener('click', () => document.getElementById('fileInput').click());
+            dropZone.addEventListener('dragover', (e) => {
+                e.preventDefault();
+                dropZone.classList.add('drag-over');
+            });
+            dropZone.addEventListener('dragleave', () => {
+                dropZone.classList.remove('drag-over');
+            });
+            dropZone.addEventListener('drop', (e) => this.handleDrop(e));
+        }
+        
+        safeAddEventListener('fileInput', 'change', (e) => this.handleFileUpload(e));
+        safeAddEventListener('textSourceForm', 'submit', (e) => this.handleTextSource(e));
+        safeAddEventListener('urlSourceForm', 'submit', (e) => this.handleURLSource(e));
+        safeAddEventListener('btnCancelText', 'click', () => this.closeModals());
+        safeAddEventListener('btnCancelURL', 'click', () => this.closeModals());
+
+        document.querySelectorAll('.source-tab').forEach(tab => {
+            tab.addEventListener('click', () => {
+                document.querySelectorAll('.source-tab').forEach(t => t.classList.remove('active'));
+                document.querySelectorAll('.source-content').forEach(c => c.classList.remove('active'));
+                tab.classList.add('active');
+                const targetId = `source${tab.dataset.source.charAt(0).toUpperCase() + tab.dataset.source.slice(1)}`;
+                const target = document.getElementById(targetId);
+                if (target) target.classList.add('active');
+            });
+        });
+
+        // Summary button in footer
+        safeAddEventListener('btnSummaryFloat', 'click', (e) => {
+            e.preventDefault();
+            this.handleTransform('summary', e.currentTarget);
+        });
+
+        safeAddEventListener('chatForm', 'submit', (e) => this.handleChat(e));
+
+        safeAddEventListener('modalOverlay', 'click', (e) => {
+            if (e.target.id === 'modalOverlay') {
+                this.closeModals();
+            }
+        });
+
+        // Handle browser back/forward buttons
+        window.addEventListener('popstate', (event) => {
+            const path = window.location.pathname;
+            const match = path.match(/^\/notes\/([a-f0-9-]+)$/);
+            if (match) {
+                const notebookId = match[1];
+                const notebook = this.notebooks.find(nb => nb.id === notebookId);
+                if (notebook && !this.currentNotebook) {
+                    this.selectNotebook(notebookId);
+                }
+            } else if (path === '/' && this.currentNotebook) {
+                this.switchView('landing');
+            }
+        });
+    }
+
+    // API 方法
+    async api(endpoint, options = {}) {
+        const timeout = options.timeout || 300000; // 默认 300 秒
+        const controller = new AbortController();
+        const id = setTimeout(() => controller.abort(), timeout);
+
+        const defaults = {
+            cache: 'no-store',
+            signal: controller.signal
+        };
+
+        // Set Content-Type header (but not for FormData - let browser set it)
+        if (!(options.body instanceof FormData)) {
+            defaults.headers = {
+                'Content-Type': 'application/json',
+            };
+        } else {
+            defaults.headers = {};
+        }
+
+        if (this.token) {
+            defaults.headers['Authorization'] = `Bearer ${this.token}`;
+        }
+
+        let url = `${this.apiBase}${endpoint}`;
+        if (!options.method || options.method === 'GET') {
+            const separator = url.includes('?') ? '&' : '?';
+            url += `${separator}_t=${Date.now()}`;
+        }
+
+        try {
+            const response = await fetch(url, { ...defaults, ...options });
+            clearTimeout(id);
+
+            if (!response.ok) {
+                const error = await response.json().catch(() => ({ error: 'Request failed' }));
+                throw new Error(error.error || 'Request failed');
+            }
+
+            if (response.status === 204) {
+                return null;
+            }
+
+            return response.json();
+        } catch (error) {
+            clearTimeout(id);
+            if (error.name === 'AbortError') {
+                throw new Error('Request timed out, please try again');
+            }
+            throw error;
+        }
+    }
+
+    // Auth Methods
+    async initAuth() {
+        if (!this.token) {
+            this.updateAuthUI();
+            return;
+        }
+
+        try {
+            const user = await this.api('/auth/me');
+            this.currentUser = user;
+            this.updateAuthUI();
+        } catch (error) {
+            console.warn('Auth check failed:', error);
+            this.handleLogout();
+        }
+    }
+
+    updateAuthUI() {
+        // Landing page auth UI
+        const authContainer = document.getElementById('authContainer');
+        const btnLogin = document.getElementById('btnLogin');
+        const userProfile = document.getElementById('userProfile');
+        const userAvatar = document.getElementById('userAvatar');
+        const userName = document.getElementById('userName');
+
+        // Workspace auth UI
+        const btnLoginWorkspace = document.getElementById('btnLoginWorkspace');
+        const userProfileWorkspace = document.getElementById('userProfileWorkspace');
+        const userAvatarWorkspace = document.getElementById('userAvatarWorkspace');
+        const userNameWorkspace = document.getElementById('userNameWorkspace');
+
+        if (this.currentUser) {
+            // Get provider display name
+            const providerNames = {
+                'github': 'GitHub',
+                'google': 'Google'
+            };
+            const providerName = providerNames[this.currentUser.provider] || this.currentUser.provider;
+            const tooltipText = `Sign-in method: ${providerName}\nAccount: ${this.currentUser.email}`;
+
+            // Update landing page
+            if (btnLogin) btnLogin.classList.add('hidden');
+            if (userProfile) userProfile.classList.remove('hidden');
+            if (userAvatar) {
+                userAvatar.src = this.currentUser.avatar_url;
+                userAvatar.title = tooltipText;
+            }
+            if (userName) userName.textContent = this.currentUser.name;
+
+            // Update workspace
+            if (btnLoginWorkspace) btnLoginWorkspace.classList.add('hidden');
+            if (userProfileWorkspace) userProfileWorkspace.classList.remove('hidden');
+            if (userAvatarWorkspace) {
+                userAvatarWorkspace.src = this.currentUser.avatar_url;
+                userAvatarWorkspace.title = tooltipText;
+            }
+            if (userNameWorkspace) userNameWorkspace.textContent = this.currentUser.name;
+        } else {
+            // Update landing page
+            if (btnLogin) btnLogin.classList.remove('hidden');
+            if (userProfile) userProfile.classList.add('hidden');
+
+            // Update workspace
+            if (btnLoginWorkspace) btnLoginWorkspace.classList.remove('hidden');
+            if (userProfileWorkspace) userProfileWorkspace.classList.add('hidden');
+        }
+    }
+
+    handleLogin() {
+        // Show login modal
+        this.showLoginModal();
+    }
+
+    showLoginModal() {
+        // Create or get existing modal
+        let modal = document.getElementById('loginModal');
+        if (!modal) {
+            // Create modal dynamically
+            modal = document.createElement('div');
+            modal.id = 'loginModal';
+            modal.className = 'login-modal';
+            modal.innerHTML = `
+                <div class="login-modal-content">
+                    <div class="login-modal-header">
+                        <h3>Choose sign-in method</h3>
+                        <button class="btn-close-login" id="btnCloseLoginModal">×</button>
+                    </div>
+                    <div class="login-modal-body">
+                        <button class="btn-login-provider" id="btnLoginGithub">
+                            <svg width="20" height="20" viewBox="0 0 16 16" fill="currentColor">
+                                <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/>
+                            </svg>
+                            Sign in with GitHub
+                        </button>
+                        <button class="btn-login-provider" id="btnLoginGoogle">
+                            <svg width="20" height="20" viewBox="0 0 16 16">
+                                <path fill="#4285F4" d="M14.9 8.16c0-.95-.08-1.65-.21-2.37H8v4.4h3.83c-.17.96-.69 2.05-1.55 2.68v2.19h2.48c1.46-1.34 2.3-3.31 2.3-5.64z"/>
+                                <path fill="#34A853" d="M8 16c2.07 0 3.83-.69 5.11-1.87l-2.48-2.19c-.69.46-1.57.73-2.63.73-2.02 0-3.74-1.37-4.35-3.19H1.11v2.26C2.38 13.89 4.99 16 8 16z"/>
+                                <path fill="#FBBC05" d="M3.65 9.52c-.16-.46-.25-.95-.25-1.47s.09-1.01.25-1.47V4.48H1.11C.4 5.87 0 7.39 0 8s.4 2.13 1.11 3.52l2.54-2z"/>
+                                <path fill="#EA4335" d="M8 3.24c1.14 0 2.17.39 2.98 1.15l2.2-2.2C11.83.87 10.07 0 8 0 4.99 0 2.38 2.11 1.11 4.48l2.54 2.26c.61-1.82 2.33-3.5 4.35-3.5z"/>
+                            </svg>
+                            Sign in with Google
+                        </button>
+                    </div>
+                </div>
+            `;
+            document.body.appendChild(modal);
+
+            // Add event listeners
+            document.getElementById('btnCloseLoginModal').addEventListener('click', () => {
+                this.closeLoginModal();
+            });
+            document.getElementById('btnLoginGithub').addEventListener('click', () => {
+                this.loginWithProvider('github');
+            });
+            document.getElementById('btnLoginGoogle').addEventListener('click', () => {
+                this.loginWithProvider('google');
+            });
+        }
+
+        modal.classList.add('active');
+    }
+
+    closeLoginModal() {
+        const modal = document.getElementById('loginModal');
+        if (modal) {
+            modal.classList.remove('active');
+        }
+    }
+
+    loginWithProvider(provider) {
+        this.closeLoginModal();
+
+        // Open popup
+        const width = 600;
+        const height = 700;
+        const left = (screen.width - width) / 2;
+        const top = (screen.height - height) / 2;
+
+        window.open(
+            `/auth/login/${provider}`,
+            'CaluxBookLogin',
+            `width=${width},height=${height},top=${top},left=${left}`
+        );
+
+        // Listen for message with origin validation
+        const messageHandler = (event) => {
+            // Validate origin for security
+            if (event.origin !== window.location.origin) {
+                console.warn('Received message from untrusted origin:', event.origin);
+                return;
+            }
+
+            if (event.data.token && event.data.user) {
+                this.token = event.data.token;
+                this.currentUser = event.data.user;
+                localStorage.setItem('token', this.token);
+
+                // Also set token as cookie for image loading
+                document.cookie = `token=${this.token}; path=/; SameSite=Lax`;
+
+                this.updateAuthUI();
+
+                // Reload data
+                this.loadNotebooks();
+            }
+        };
+
+        window.addEventListener('message', messageHandler, { once: true });
+    }
+
+    handleLogout() {
+        this.token = null;
+        this.currentUser = null;
+        localStorage.removeItem('token');
+
+        // Also remove token cookie
+        document.cookie = 'token=; path=/; expires=Thu, 01 Jan 1970 00:00:00 GMT';
+
+        // Clear cache
+        this.cache.delete('notebooks');
+
+        this.updateAuthUI();
+
+        // Clear data
+        this.notebooks = [];
+        this.renderNotebooks();
+        this.switchView('landing');
+    }
+
+    // 笔记本方法
+    async loadNotebooks() {
+        // Always load public notebooks showcase (regardless of private notebooks)
+        await this.loadPublicNotebooksShowcase();
+
+        try {
+            // 先尝试从缓存获取
+            const cached = this.cache.get('notebooks');
+            if (cached) {
+                this.notebooks = cached;
+                this.renderNotebooks();
+                this.updateFooter();
+            }
+
+            // 从服务器获取最新数据（包含统计信息）
+            const notebooks = await this.api('/notebooks/stats');
+            this.notebooks = notebooks;
+
+            // 更新缓存
+            this.cache.set('notebooks', notebooks);
+
+            this.renderNotebooks();
+            this.updateFooter();
+        } catch (error) {
+            // 401 Unauthorized is expected for non-logged-in users, don't show error
+            if (error.message && !error.message.includes('401')) {
+                console.warn('User not signed in, skipping private notebook load');
+            } else {
+                this.showError('Failed to load notebooks');
+            }
+        }
+    }
+
+    renderNotebooks() {
+        this.renderNotebookCards();
+        this.loadPublicNotebooksShowcase();
+    }
+
+    renderNotebookCards() {
+        const container = document.getElementById('notebookGridLanding');
+        const template = document.getElementById('notebookCardTemplate');
+
+        container.innerHTML = '';
+
+        if (this.notebooks.length === 0) {
+            container.innerHTML = `
+                <div class="empty-state">
+                    <svg width="64" height="64" viewBox="0 0 64 64" fill="none" stroke="currentColor" stroke-width="1">
+                        <rect x="12" y="12" width="40" height="40" rx="4"/>
+                        <line x1="20" y1="24" x2="44" y2="24"/>
+                        <line x1="20" y1="32" x2="40" y2="32"/>
+                    </svg>
+                    <p>Start your knowledge journey</p>
+                    <button class="btn-primary" onclick="app.showNewNotebookModal()">Create your first notebook</button>
+                </div>
+            `;
+            return;
+        }
+
+        this.notebooks.forEach(nb => {
+            const clone = template.content.cloneNode(true);
+            const card = clone.querySelector('.notebook-card');
+
+            card.dataset.id = nb.id;
+            card.querySelector('.notebook-card-name').textContent = nb.name;
+            card.querySelector('.notebook-card-desc').textContent = nb.description || 'No description';
+
+            // 直接使用从 API 获取的统计信息
+            card.querySelector('.stat-sources').textContent = `${nb.source_count || 0} sources`;
+            card.querySelector('.stat-notes').textContent = `${nb.note_count || 0} notes`;
+            card.querySelector('.stat-date').textContent = this.formatDate(nb.created_at);
+
+            // 更新分享按钮状态
+            const shareCardBtn = clone.querySelector('.btn-share-card');
+            if (shareCardBtn) {
+                if (nb.is_public) {
+                    shareCardBtn.classList.add('active');
+                    shareCardBtn.setAttribute('title', 'Public');
+                } else {
+                    shareCardBtn.classList.remove('active');
+                    shareCardBtn.setAttribute('title', 'Share');
+                }
+
+                // Share button event
+                shareCardBtn.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    this.showShareDialog(nb);
+                });
+            }
+
+            card.addEventListener('click', (e) => {
+                if (!e.target.closest('.btn-delete-card') && !e.target.closest('.btn-share-card')) {
+                    this.selectNotebook(nb.id);
+                }
+            });
+
+            const deleteCardBtn = card.querySelector('.btn-delete-card');
+            deleteCardBtn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                if (confirm('Are you sure you want to delete this notebook?')) {
+                    this.deleteNotebook(nb.id);
+                }
+            });
+
+            container.appendChild(clone);
+        });
+    }
+
+    // Load and render public notebooks showcase
+    async loadPublicNotebooksShowcase() {
+        // Prevent duplicate calls
+        if (this._publicNotebooksLoaded) return;
+        this._publicNotebooksLoaded = true;
+
+        try {
+            const response = await fetch('/public/notebooks');
+            if (!response.ok) return;
+
+            const notebooks = await response.json();
+            this.renderPublicNotebooksShowcase(notebooks);
+        } catch (error) {
+            console.error('Failed to load public notebooks showcase:', error);
+        }
+    }
+
+    // Cache to avoid duplicate calls
+    _publicNotebooksLoaded = false;
+
+    renderPublicNotebooksShowcase(notebooks) {
+        const container = document.getElementById('publicShowcase');
+        const grid = document.getElementById('publicShowcaseGrid');
+
+        if (!container || !grid) return;
+
+        grid.innerHTML = '';
+
+        if (notebooks.length === 0) {
+            container.style.display = 'none';
+            return;
+        }
+
+        container.style.display = 'block';
+
+        notebooks.forEach(nb => {
+            const card = document.createElement('a');
+            card.className = 'public-showcase-card';
+            card.href = `/public/${nb.public_token}`;
+
+            // Generate background style if cover image exists
+            if (nb.cover_image_url) {
+                card.style.backgroundImage = `url('${nb.cover_image_url}')`;
+                card.style.backgroundSize = 'cover';
+                card.style.backgroundPosition = 'center';
+                card.classList.add('has-cover-image');
+            }
+
+            card.innerHTML = `
+                <div class="public-showcase-card-content">
+                    <h3 class="public-showcase-card-title">${this.escapeHtml(nb.name)}</h3>
+                    <div class="public-showcase-card-footer">
+                        <div class="public-showcase-card-stats">
+                            <span>${nb.source_count || 0} sources</span>
+                            <span>${nb.note_count || 0} notes</span>
+                        </div>
+                        <span class="public-showcase-card-date">${this.formatDate(nb.created_at)}</span>
+                    </div>
+                </div>
+            `;
+
+            grid.appendChild(card);
+        });
+    }
+
+    switchView(view) {
+        const landing = document.getElementById('landingPage');
+        const workspace = document.getElementById('workspaceContainer');
+        const header = document.querySelector('.app-header');
+        const summaryBtn = document.getElementById('btnSummaryFloat');
+
+        if (view === 'workspace') {
+            landing.classList.add('hidden');
+            workspace.classList.remove('hidden');
+            header.classList.add('hidden');
+            if (summaryBtn) summaryBtn.style.display = '';
+        } else {
+            landing.classList.remove('hidden');
+            workspace.classList.add('hidden');
+            header.classList.remove('hidden');
+            if (summaryBtn) summaryBtn.style.display = 'none';
+            this.currentNotebook = null;
+            this.renderNotebookCards();
+            // Update URL to root when returning to landing page
+            window.history.pushState({}, '', '/');
+        }
+    }
+
+    toggleRightPanel() {
+        const grid = document.querySelector('.main-grid');
+        grid.classList.toggle('right-collapsed');
+    }
+
+    toggleLeftPanel() {
+        const grid = document.querySelector('.main-grid');
+        grid.classList.toggle('left-collapsed');
+    }
+
+    switchPanelTab(tab) {
+        // Update tab buttons
+        document.querySelectorAll('.tab-btn').forEach(t => {
+            t.classList.toggle('active', t.dataset.tab === tab);
+        });
+
+        // Update content visibility
+        const chatWrapper = document.querySelector('.chat-messages-wrapper');
+        const noteViewContainer = document.querySelector('.note-view-container');
+        const notesDetailsView = document.querySelector('.notes-details-view');
+
+        if (tab === 'note') {
+            chatWrapper.style.display = 'none';
+            if (notesDetailsView) notesDetailsView.style.display = 'none';
+            if (noteViewContainer) {
+                noteViewContainer.style.display = 'flex';
+            }
+        } else if (tab === 'chat') {
+            chatWrapper.style.display = 'flex';
+            if (notesDetailsView) notesDetailsView.style.display = 'none';
+            if (noteViewContainer) {
+                noteViewContainer.style.display = 'none';
+            }
+        } else if (tab === 'notes_list') {
+            chatWrapper.style.display = 'none';
+            if (noteViewContainer) noteViewContainer.style.display = 'none';
+            if (notesDetailsView) {
+                notesDetailsView.style.display = 'flex';
+                // Only render if not in public mode (public mode already has data loaded)
+                if (!this.currentPublicToken) {
+                    this.renderNotesCompactGrid();
+                }
+            }
+        }
+    }
+
+    async showNotesListTab() {
+        const tabBtn = document.getElementById('tabBtnNotesList');
+        tabBtn.classList.remove('hidden');
+
+        // Ensure notesDetailsView container exists
+        let notesDetailsView = document.querySelector('.notes-details-view');
+        if (!notesDetailsView) {
+            const chatWrapper = document.querySelector('.chat-messages-wrapper');
+            notesDetailsView = document.createElement('div');
+            notesDetailsView.className = 'notes-details-view';
+            notesDetailsView.innerHTML = '<div class="notes-compact-grid"></div>';
+            chatWrapper.insertAdjacentElement('afterend', notesDetailsView);
+        }
+
+        this.switchPanelTab('notes_list');
+    }
+
+    closeNotesListTab() {
+        const tabBtn = document.getElementById('tabBtnNotesList');
+        tabBtn.classList.add('hidden');
+        
+        const notesDetailsView = document.querySelector('.notes-details-view');
+        if (notesDetailsView) notesDetailsView.style.display = 'none';
+        
+        if (tabBtn.classList.contains('active')) {
+            this.switchPanelTab('chat');
+        }
+    }
+
+    closeNoteTab() {
+        const noteViewContainer = document.querySelector('.note-view-container');
+        if (noteViewContainer) noteViewContainer.remove();
+        
+        const tabBtnNote = document.getElementById('tabBtnNote');
+        if (tabBtnNote) tabBtnNote.style.display = 'none';
+
+        this.switchPanelTab('chat');
+    }
+
+    async renderNotesCompactGrid() {
+        if (!this.currentNotebook) return;
+
+        const container = document.querySelector('.notes-compact-grid');
+        if (!container) return;
+
+        try {
+            const notes = await this.api(`/notebooks/${this.currentNotebook.id}/notes`);
+            container.innerHTML = '';
+
+            notes.forEach(note => {
+                const card = document.createElement('div');
+                card.className = 'compact-note-card';
+                card.dataset.noteId = note.id;
+
+                const plainText = note.content
+                    .replace(/^#+\s+/gm, '')
+                    .replace(/\*\*/g, '')
+                    .replace(/\*/g, '')
+                    .replace(/`/g, '')
+                    .replace(/\n+/g, ' ')
+                    .trim();
+
+                card.innerHTML = `
+                    <button class="btn-delete-compact-note" title="Delete note">
+                        <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.5">
+                            <path d="M4.5 4.5L9.5 9.5M9.5 4.5L4.5 9.5"/>
+                        </svg>
+                    </button>
+                    <div class="note-type">${note.type}</div>
+                    <h4 class="note-title">${note.title}</h4>
+                    <p class="note-preview">${plainText}</p>
+                    <div class="note-footer">
+                        <span>${this.formatDate(note.created_at)}</span>
+                        <span>${note.source_ids?.length || 0} sources</span>
+                    </div>
+                `;
+
+                // Delete button event
+                const deleteBtn = card.querySelector('.btn-delete-compact-note');
+                deleteBtn.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    if (confirm('Are you sure you want to delete this note?')) {
+                        this.deleteNote(note.id);
+                    }
+                });
+
+                card.addEventListener('click', () => this.viewNote(note));
+                container.appendChild(card);
+            });
+        } catch (error) {
+            console.error('Failed to load notes for grid:', error);
+        }
+    }
+
+    // Render notes compact grid for public notebooks (without API call)
+    async renderNotesCompactGridPublic(notes) {
+        const container = document.querySelector('.notes-compact-grid');
+        if (!container) return;
+
+        container.innerHTML = '';
+
+        notes.forEach(note => {
+            const card = document.createElement('div');
+            card.className = 'compact-note-card';
+
+            const plainText = note.content
+                .replace(/^#+\s+/gm, '')
+                .replace(/\*\*/g, '')
+                .replace(/\*/g, '')
+                .replace(/`/g, '')
+                .replace(/\n+/g, ' ')
+                .trim();
+
+            card.innerHTML = `
+                <div class="note-type">${note.type}</div>
+                <h4 class="note-title">${note.title}</h4>
+                <p class="note-preview">${plainText}</p>
+                <div class="note-footer">
+                    <span>${this.formatDate(note.created_at)}</span>
+                    <span>${note.source_ids?.length || 0} sources</span>
+                </div>
+            `;
+
+            card.addEventListener('click', () => this.viewNote(note));
+            container.appendChild(card);
+        });
+    }
+
+    async selectNotebook(id) {
+        this.currentNotebook = this.notebooks.find(nb => nb.id === id);
+        this.currentPublicToken = null;  // Clear public token when selecting regular notebook
+
+        // Reset readonly mode in case previous notebook was public
+        this.setReadOnlyMode(false);
+
+        const nameDisplay = document.getElementById('currentNotebookName');
+        nameDisplay.textContent = this.currentNotebook.name;
+        nameDisplay.classList.add('editable');
+
+        // Update URL to /notes/:id for shareable links
+        this.updateURL(id);
+
+        // Update share button state
+        this.updateShareButtonState();
+
+        this.switchView('workspace');
+
+        // Default to Chat tab and remove any existing note view
+        this.switchPanelTab('chat');
+        const noteView = document.querySelector('.note-view-container');
+        if (noteView) noteView.remove();
+
+        await Promise.all([
+            this.loadSources(),
+            this.loadNotes(),
+            this.loadChatSessions()
+        ]);
+
+        this.setStatus(`Selected: ${this.currentNotebook.name}`);
+    }
+
+    // 更新分享按钮状态
+    updateShareButtonState() {
+        const shareBtn = document.getElementById('btnShareNotebook');
+        const shareText = document.getElementById('shareButtonText');
+        if (!shareBtn || !this.currentNotebook) return;
+
+        if (this.currentNotebook.is_public) {
+            shareText.textContent = 'Public';
+            shareBtn.classList.add('active');
+        } else {
+            shareText.textContent = 'Share';
+            shareBtn.classList.remove('active');
+        }
+    }
+
+    // 显示分享对话框
+    showShareDialog(notebook) {
+        this.currentShareNotebook = notebook;
+        const modal = document.getElementById('shareModal');
+        const overlay = document.getElementById('modalOverlay');
+
+        // 设置笔记本名称
+        document.getElementById('shareNotebookName').textContent = notebook.name;
+
+        // 更新状态显示
+        this.updateShareModalState(notebook);
+
+        // 显示模态框
+        modal.classList.add('active');
+        overlay.classList.add('active');
+    }
+
+    // 更新分享对话框状态
+    updateShareModalState(notebook) {
+        const statusIcon = document.getElementById('shareStatusIcon');
+        const statusText = document.getElementById('shareStatusText');
+        const linkSection = document.getElementById('shareLinkSection');
+        const linkInput = document.getElementById('shareLinkInput');
+        const toggleBtn = document.getElementById('btnToggleShare');
+
+        if (notebook.is_public) {
+            statusIcon.className = 'status-icon public';
+            statusIcon.innerHTML = '<svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 9l2-2 2 2m-4 0l2-2 2-2"/></svg>';
+            statusText.textContent = 'Notebook is public';
+            linkSection.style.display = 'flex';
+            linkInput.value = `${window.location.origin}/public/${notebook.public_token}`;
+            toggleBtn.textContent = 'Make Private';
+            toggleBtn.className = 'btn-secondary';
+        } else {
+            statusIcon.className = 'status-icon private';
+            statusIcon.innerHTML = '<svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="6" width="8" height="4" rx="1"/></svg>';
+            statusText.textContent = 'Notebook is private';
+            linkSection.style.display = 'none';
+            toggleBtn.textContent = 'Make Public';
+            toggleBtn.className = 'btn-primary';
+        }
+    }
+
+    // 关闭分享对话框
+    closeShareModal() {
+        const modal = document.getElementById('shareModal');
+        const overlay = document.getElementById('modalOverlay');
+        modal.classList.remove('active');
+        overlay.classList.remove('active');
+        this.currentShareNotebook = null;
+    }
+
+    // 复制分享链接
+    copyShareLink() {
+        const linkInput = document.getElementById('shareLinkInput');
+        linkInput.select();
+        linkInput.setSelectionRange(0, 99999); // For mobile devices
+
+        navigator.clipboard.writeText(linkInput.value).then(() => {
+            this.showToast('Link copied to clipboard', 'success');
+        }).catch(() => {
+            // Fallback
+            try {
+                document.execCommand('copy');
+                this.showToast('Link copied to clipboard', 'success');
+            } catch (err) {
+                this.showError('Copy failed, please copy manually');
+            }
+        });
+    }
+
+    // 切换笔记本公开状态（从对话框调用）
+    async toggleShareFromModal() {
+        if (!this.currentShareNotebook) return;
+
+        const newPublicState = !this.currentShareNotebook.is_public;
+        try {
+            const result = await this.api(`/notebooks/${this.currentShareNotebook.id}/public`, {
+                method: 'PUT',
+                body: JSON.stringify({ is_public: newPublicState })
+            });
+
+            // 更新当前笔记本
+            if (this.currentNotebook && this.currentNotebook.id === this.currentShareNotebook.id) {
+                this.currentNotebook = result;
+                this.updateShareButtonState();
+            }
+
+            // 更新笔记本列表中的数据
+            const nb = this.notebooks.find(n => n.id === this.currentShareNotebook.id);
+            if (nb) {
+                nb.is_public = result.is_public;
+                nb.public_token = result.public_token;
+            }
+
+            // 更新对话框状态
+            this.currentShareNotebook = result;
+            this.updateShareModalState(result);
+
+            // 刷新笔记本列表
+            this.renderNotebooks();
+
+            this.showToast(newPublicState ? 'Notebook is now public' : 'Notebook is now private', 'success');
+        } catch (error) {
+            this.showError(`Operation failed: ${error.message}`);
+        }
+    }
+
+    initNotebookNameEditor() {
+        const nameDisplay = document.getElementById('currentNotebookName');
+        const nameEditor = document.getElementById('notebookNameEditor');
+        const nameInput = document.getElementById('notebookNameInput');
+        const saveBtn = document.getElementById('btnSaveNotebookName');
+        const cancelBtn = document.getElementById('btnCancelNotebookName');
+
+        // 双击进入编辑模式
+        nameDisplay.addEventListener('dblclick', () => {
+            this.startEditingNotebookName();
+        });
+
+        // 点击保存按钮
+        saveBtn.addEventListener('click', () => {
+            this.saveNotebookName();
+        });
+
+        // 点击取消按钮
+        cancelBtn.addEventListener('click', () => {
+            this.cancelEditNotebookName();
+        });
+
+        // 输入框回车保存
+        nameInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+                this.saveNotebookName();
+            } else if (e.key === 'Escape') {
+                this.cancelEditNotebookName();
+            }
+        });
+    }
+
+    startEditingNotebookName() {
+        const nameDisplay = document.getElementById('currentNotebookName');
+        const nameEditor = document.getElementById('notebookNameEditor');
+        const nameInput = document.getElementById('notebookNameInput');
+
+        nameInput.value = this.currentNotebook.name;
+        nameDisplay.classList.add('hidden');
+        nameEditor.classList.remove('hidden');
+        nameInput.focus();
+        nameInput.select();
+    }
+
+    async saveNotebookName() {
+        const nameInput = document.getElementById('notebookNameInput');
+        const newName = nameInput.value.trim();
+
+        if (!newName) {
+            this.showError('Notebook name cannot be empty');
+            return;
+        }
+
+        if (newName === this.currentNotebook.name) {
+            this.cancelEditNotebookName();
+            return;
+        }
+
+        try {
+            this.showLoading('Saving...');
+
+            const updated = await this.api(`/notebooks/${this.currentNotebook.id}`, {
+                method: 'PUT',
+                body: JSON.stringify({
+                    name: newName,
+                    description: this.currentNotebook.description
+                })
+            });
+
+            // 更新本地数据
+            this.currentNotebook.name = newName;
+            this.currentNotebook.updated_at = updated.updated_at;
+
+            // 更新 notebooks 列表中的数据
+            const nb = this.notebooks.find(n => n.id === this.currentNotebook.id);
+            if (nb) {
+                nb.name = newName;
+                nb.updated_at = updated.updated_at;
+            }
+
+            // 使缓存失效
+            this.cache.delete('notebooks');
+
+            // 更新显示
+            document.getElementById('currentNotebookName').textContent = newName;
+            this.cancelEditNotebookName();
+            this.hideLoading();
+            this.setStatus('Notebook name updated');
+
+        } catch (error) {
+            this.hideLoading();
+            this.showError(error.message);
+        }
+    }
+
+    cancelEditNotebookName() {
+        const nameDisplay = document.getElementById('currentNotebookName');
+        const nameEditor = document.getElementById('notebookNameEditor');
+
+        nameDisplay.classList.remove('hidden');
+        nameEditor.classList.add('hidden');
+    }
+
+    showNewNotebookModal() {
+        document.getElementById('newNotebookModal').classList.add('active');
+        document.getElementById('modalOverlay').classList.add('active');
+        document.querySelector('#newNotebookForm input[name="name"]').focus();
+    }
+
+    async handleCreateNotebook(e) {
+        e.preventDefault();
+        const form = e.target;
+        const data = new FormData(form);
+
+        this.showLoading('Processing...');
+
+        try {
+            const notebook = await this.api('/notebooks', {
+                method: 'POST',
+                body: JSON.stringify({
+                    name: data.get('name'),
+                    description: data.get('description') || undefined,
+                }),
+            });
+
+            // 使缓存失效
+            this.cache.delete('notebooks');
+
+            this.notebooks.push(notebook);
+            this.renderNotebooks();
+            this.selectNotebook(notebook.id);
+            this.closeModals();
+            form.reset();
+            this.hideLoading();
+        } catch (error) {
+            this.hideLoading();
+            this.showError(error.message);
+        }
+    }
+
+    async deleteNotebook(id) {
+        try {
+            await this.api(`/notebooks/${id}`, { method: 'DELETE' });
+
+            // 使缓存失效
+            this.cache.delete('notebooks');
+            this.cache.deletePattern(`sources_${id}`);
+            this.cache.deletePattern(`notes_${id}`);
+            this.cache.deletePattern(`chat_${id}`);
+
+            this.notebooks = this.notebooks.filter(nb => nb.id !== id);
+
+            if (this.currentNotebook?.id === id) {
+                this.currentNotebook = null;
+                this.clearContentAreas();
+                this.switchView('landing');
+            }
+
+            this.renderNotebooks();
+            this.updateFooter();
+        } catch (error) {
+            this.showError('Failed to delete notebook: ' + error.message);
+        }
+    }
+
+    clearContentAreas() {
+        const sourcesContainer = document.getElementById('sourcesGrid');
+        sourcesContainer.innerHTML = `
+            <div class="empty-state">
+                <svg width="64" height="64" viewBox="0 0 64 64" fill="none" stroke="currentColor" stroke-width="1">
+                    <path d="M20 8 L44 8 L48 12 L48 56 L20 56 Z"/>
+                    <polyline points="44,8 44,12 48,12"/>
+                    <line x1="28" y1="24" x2="40" y2="24"/>
+                    <line x1="28" y1="32" x2="40" y2="32"/>
+                    <line x1="28" y1="40" x2="36" y2="40"/>
+                </svg>
+                <p>Add sources to get started</p>
+                <p class="empty-hint">Supports PDF, TXT, MD, DOCX, HTML</p>
+            </div>
+        `;
+
+        const notesContainer = document.getElementById('notesList');
+        notesContainer.innerHTML = `
+            <div class="empty-state">
+                <svg width="48" height="48" viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="1.5">
+                    <path d="M12 4 L36 4 L40 8 L40 44 L12 44 Z"/>
+                    <polyline points="36,4 36,8 40,8"/>
+                </svg>
+                <p>No notes yet</p>
+                <p class="empty-hint">Use transforms to generate notes from sources</p>
+            </div>
+        `;
+
+        const chatContainer = document.getElementById('chatMessages');
+        chatContainer.innerHTML = `
+            <div class="chat-welcome">
+                <svg width="40" height="40" viewBox="0 0 40 40" fill="none" stroke="currentColor" stroke-width="1.5">
+                    <circle cx="20" cy="12" r="6"/>
+                    <path d="M8 38 C8 28 14 22 20 22 C26 22 32 28 32 38"/>
+                </svg>
+                <h3>Chat with sources</h3>
+                <p>Ask questions about your notebook content</p>
+            </div>
+        `;
+
+        this.currentChatSession = null;
+    }
+
+    // 来源方法
+    async loadSources() {
+        if (!this.currentNotebook) return;
+
+        const container = document.getElementById('sourcesGrid');
+        const template = document.getElementById('sourceTemplate');
+
+        try {
+            // 先尝试从缓存获取
+            const cacheKey = `sources_${this.currentNotebook.id}`;
+            const cached = this.cache.get(cacheKey);
+
+            // 从服务器获取最新数据
+            const sources = await this.api(`/notebooks/${this.currentNotebook.id}/sources`);
+
+            // 更新缓存
+            this.cache.set(cacheKey, sources);
+
+            if (sources.length === 0) {
+                this.clearContentAreas();
+                this._stopStatusPolling();
+                return;
+            }
+
+            container.innerHTML = '';
+
+            let hasProcessing = false;
+
+            sources.forEach(source => {
+                const clone = template.content.cloneNode(true);
+                const card = clone.querySelector('.source-card');
+
+                card.dataset.id = source.id;
+                card.dataset.status = source.status || 'pending';
+                card.querySelector('.source-type-badge').textContent = source.type;
+                card.querySelector('.source-name').textContent = source.name;
+                card.querySelector('.source-meta').textContent = this.formatFileSize(source.file_size) || 'Text source';
+                card.querySelector('.chunk-count').textContent = source.chunk_count || 0;
+
+                // Status indicator
+                const statusIndicator = card.querySelector('.source-status-indicator');
+                const statusText = card.querySelector('.status-text');
+                const status = source.status || 'pending';
+                statusIndicator.dataset.status = status;
+
+                if (status === 'ready') {
+                    statusIndicator.style.display = 'none';
+                } else if (status === 'error') {
+                    statusText.textContent = source.error_message || 'Error';
+                    statusText.title = source.error_message || 'Processing failed';
+                    card.dataset.processing = 'false';
+                } else {
+                    const statusLabels = {
+                        pending: 'Queued...',
+                        extracting: 'Extracting text...',
+                        embedding: 'Building index...',
+                    };
+                    statusText.textContent = statusLabels[status] || status;
+                    card.dataset.processing = 'true';
+                    hasProcessing = true;
+                }
+
+                const icon = this.getSourceIcon(source.type);
+                card.querySelector('.source-icon').innerHTML = icon;
+
+                const removeBtn = card.querySelector('.btn-remove-source');
+                removeBtn.addEventListener('click', () => {
+                    this.removeSource(source.id);
+                });
+
+                container.appendChild(clone);
+            });
+
+            this.updateFooter();
+
+            // Start/stop polling based on whether any sources are still processing
+            if (hasProcessing) {
+                this._startStatusPolling();
+            } else {
+                this._stopStatusPolling();
+            }
+        } catch (error) {
+            console.error('Failed to load sources:', error);
+        }
+    }
+
+    // ----- Source status polling -----
+
+    _startStatusPolling() {
+        if (this._statusPollTimer) return; // already polling
+        this._statusPollTimer = setInterval(() => this._pollSourceStatus(), this._statusPollInterval);
+    }
+
+    _stopStatusPolling() {
+        if (this._statusPollTimer) {
+            clearInterval(this._statusPollTimer);
+            this._statusPollTimer = null;
+        }
+    }
+
+    async _pollSourceStatus() {
+        if (!this.currentNotebook) {
+            this._stopStatusPolling();
+            return;
+        }
+
+        try {
+            const statuses = await this.api(`/notebooks/${this.currentNotebook.id}/sources/status`);
+            let hasProcessing = false;
+
+            for (const s of statuses) {
+                const card = document.querySelector(`.source-card[data-id="${s.id}"]`);
+                if (!card) continue;
+
+                const prevStatus = card.dataset.status;
+                card.dataset.status = s.status;
+
+                const indicator = card.querySelector('.source-status-indicator');
+                const statusTextEl = card.querySelector('.status-text');
+
+                if (s.status === 'ready') {
+                    indicator.style.display = 'none';
+                    card.dataset.processing = 'false';
+                    card.querySelector('.chunk-count').textContent = s.chunk_count || 0;
+                    // Flash green briefly when transitioning to ready
+                    if (prevStatus !== 'ready') {
+                        card.style.borderLeftColor = '#07c160';
+                        setTimeout(() => { card.style.borderLeftColor = ''; }, 2000);
+                    }
+                } else if (s.status === 'error') {
+                    indicator.dataset.status = 'error';
+                    indicator.style.display = 'flex';
+                    statusTextEl.textContent = s.error_message || 'Error';
+                    statusTextEl.title = s.error_message || '';
+                    card.dataset.processing = 'false';
+                } else {
+                    const statusLabels = {
+                        pending: 'Queued...',
+                        extracting: 'Extracting text...',
+                        embedding: 'Building index...',
+                    };
+                    indicator.dataset.status = s.status;
+                    indicator.style.display = 'flex';
+                    statusTextEl.textContent = statusLabels[s.status] || s.status;
+                    card.dataset.processing = 'true';
+                    hasProcessing = true;
+                }
+            }
+
+            if (!hasProcessing) {
+                this._stopStatusPolling();
+            }
+        } catch (error) {
+            console.warn('Status poll error:', error);
+        }
+    }
+
+    getSourceIcon(type) {
+        const icons = {
+            file: '<svg viewBox="0 0 40 40" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M10 4 L24 4 L30 10 L30 36 L10 36 Z"/><polyline points="24,4 24,10 30,10"/></svg>',
+            text: '<svg viewBox="0 0 40 40" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M8 6 L32 6"/><path d="M8 12 L32 12"/><path d="M8 18 L28 18"/><path d="M8 24 L32 24"/><path d="M8 30 L24 30"/></svg>',
+            url: '<svg viewBox="0 0 40 40" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 20 C12 14 16 10 22 10 C28 10 32 14 32 20 C32 26 28 30 22 30"/><path d="M28 20 C28 26 24 30 18 30 C12 30 8 26 8 20 C8 14 12 10 18 10"/></svg>',
+            insight: '<svg viewBox="0 0 40 40" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="20" cy="20" r="14"/><path d="M20 12 L20 22"/><path d="M20 26 L20 28"/><circle cx="20" cy="20" r="8" stroke-dasharray="2 2"/></svg>',
+        };
+        return icons[type] || icons.file;
+    }
+
+    formatFileSize(bytes) {
+        if (!bytes) return null;
+        if (bytes < 1024) return bytes + ' B';
+        if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+        return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+    }
+
+    // Render sources from data (for public notebooks)
+    async renderSourcesList(sources) {
+        const container = document.getElementById('sourcesGrid');
+        const template = document.getElementById('sourceTemplate');
+
+        if (!container || !template) return;
+
+        container.innerHTML = '';
+
+        if (sources.length === 0) {
+            this.clearContentAreas();
+            return;
+        }
+
+        sources.forEach(source => {
+            const clone = template.content.cloneNode(true);
+            const card = clone.querySelector('.source-card');
+
+            card.dataset.id = source.id;
+            card.querySelector('.source-type-badge').textContent = source.type;
+            card.querySelector('.source-name').textContent = source.name;
+            card.querySelector('.source-meta').textContent = this.formatFileSize(source.file_size) || 'Text source';
+            card.querySelector('.chunk-count').textContent = source.chunk_count || 0;
+
+            // Hide status indicator for public notebooks (already processed)
+            const statusIndicator = card.querySelector('.source-status-indicator');
+            if (statusIndicator) statusIndicator.style.display = 'none';
+
+            const icon = this.getSourceIcon(source.type);
+            card.querySelector('.source-icon').innerHTML = icon;
+
+            // Remove delete button for public notebooks
+            const removeBtn = card.querySelector('.btn-remove-source');
+            if (removeBtn) {
+                removeBtn.style.display = 'none';
+            }
+
+            container.appendChild(clone);
+        });
+
+        this.updateFooter();
+    }
+
+    // Render notes from data (for public notebooks)
+    async renderNotesList(notes) {
+        const container = document.getElementById('notesList');
+        const template = document.getElementById('noteTemplate');
+
+        if (!container || !template) return;
+
+        container.innerHTML = '';
+
+        if (notes.length === 0) {
+            return;
+        }
+
+        notes.forEach(note => {
+            const clone = template.content.cloneNode(true);
+            const item = clone.querySelector('.note-item');
+
+            item.dataset.id = note.id;
+            item.querySelector('.note-type-badge').textContent = this.noteTypeNameMap[note.type] || note.type.toUpperCase();
+            item.querySelector('.note-title').textContent = note.title;
+
+            const plainText = note.content
+                .replace(/^#+\s+/gm, '')
+                .replace(/\*\*/g, '')
+                .replace(/\*/g, '')
+                .replace(/`/g, '')
+                .replace(/\ \[([^\]]+)\]\([^)]+\)/g, '$1')
+                .replace(/\n+/g, ' ')
+                .trim();
+
+            item.querySelector('.note-preview').textContent = plainText;
+            item.querySelector('.note-date').textContent = this.formatDate(note.created_at);
+            item.querySelector('.note-sources').textContent = `${note.source_ids?.length || 0} sources`;
+
+            // Remove delete button for public notebooks
+            const deleteBtn = item.querySelector('.btn-delete-note');
+            if (deleteBtn) {
+                deleteBtn.style.display = 'none';
+            }
+
+            item.addEventListener('click', (e) => {
+                if (!e.target.closest('.btn-delete-note')) {
+                    this.viewNote(note);
+                }
+            });
+
+            container.appendChild(clone);
+        });
+
+        this.updateFooter();
+    }
+
+    showAddSourceModal() {
+        if (!this.currentNotebook) {
+            this.showError('Please select a notebook first');
+            return;
+        }
+        document.getElementById('addSourceModal').classList.add('active');
+        document.getElementById('modalOverlay').classList.add('active');
+    }
+
+    async handleFileUpload(e) {
+        const files = e.target.files;
+        if (!files.length) return;
+
+        if (!this.currentNotebook) {
+            this.showError('Please select a notebook first');
+            return;
+        }
+
+        this.showLoading('Processing...');
+
+        for (const file of files) {
+            const formData = new FormData();
+            formData.append('file', file);
+            formData.append('notebook_id', this.currentNotebook.id);
+
+            try {
+                await this.api('/upload', {
+                    method: 'POST',
+                    body: formData,
+                });
+            } catch (error) {
+                this.showError(`Upload failed: ${file.name} - ${error.message}`);
+            }
+        }
+
+        this.hideLoading();
+        this.closeModals();
+        await this.loadSources();
+        await this.updateCurrentNotebookCounts();
+        document.getElementById('fileInput').value = '';
+
+        // Start polling since uploaded files are processing in the background
+        this._startStatusPolling();
+    }
+
+    async handleTextSource(e) {
+        e.preventDefault();
+        const form = e.target;
+        const data = new FormData(form);
+
+        this.showLoading('Processing...');
+
+        try {
+            await this.api(`/notebooks/${this.currentNotebook.id}/sources`, {
+                method: 'POST',
+                body: JSON.stringify({
+                    name: data.get('name'),
+                    type: 'text',
+                    content: data.get('content'),
+                }),
+            });
+
+            this.hideLoading();
+            this.closeModals();
+            form.reset();
+            await this.loadSources();
+            await this.updateCurrentNotebookCounts();
+        } catch (error) {
+            this.hideLoading();
+            this.showError(error.message);
+        }
+    }
+
+    async handleURLSource(e) {
+        e.preventDefault();
+        const form = e.target;
+        const data = new FormData(form);
+
+        this.showLoading('Fetching URL content...');
+
+        try {
+            await this.api(`/notebooks/${this.currentNotebook.id}/sources`, {
+                method: 'POST',
+                body: JSON.stringify({
+                    name: data.get('name') || data.get('url'),
+                    type: 'url',
+                    url: data.get('url'),
+                }),
+            });
+
+            this.hideLoading();
+            this.closeModals();
+            form.reset();
+            await this.loadSources();
+            await this.updateCurrentNotebookCounts();
+        } catch (error) {
+            this.hideLoading();
+            this.showError(error.message);
+        }
+    }
+
+    handleDrop(e) {
+        e.preventDefault();
+        document.getElementById('dropZone').classList.remove('drag-over');
+
+        const files = e.dataTransfer.files;
+        if (!files.length) return;
+
+        document.getElementById('fileInput').files = files;
+        this.handleFileUpload({ target: { files } });
+    }
+
+    async removeSource(id) {
+        try {
+            await this.api(`/notebooks/${this.currentNotebook.id}/sources/${id}`, {
+                method: 'DELETE',
+            });
+            await this.loadSources();
+            await this.updateCurrentNotebookCounts();
+        } catch (error) {
+            this.showError('Failed to remove source');
+        }
+    }
+
+    // 笔记方法
+    async loadNotes() {
+        if (!this.currentNotebook) return;
+
+        const container = document.getElementById('notesList');
+        const template = document.getElementById('noteTemplate');
+        const countHeader = document.querySelector('.section-notes .panel-title');
+
+        try {
+            // 先尝试从缓存获取
+            const cacheKey = `notes_${this.currentNotebook.id}`;
+            const cached = this.cache.get(cacheKey);
+
+            // 从服务器获取最新数据
+            const notes = await this.api(`/notebooks/${this.currentNotebook.id}/notes`);
+
+            // 更新缓存
+            this.cache.set(cacheKey, notes);
+            
+            if (countHeader) {
+                countHeader.textContent = `Notes (${notes.length})`;
+            }
+
+            if (notes.length === 0) {
+                container.innerHTML = `
+                    <div class="empty-state">
+                        <svg width="48" height="48" viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="1.5">
+                            <path d="M12 4 L36 4 L40 8 L40 44 L12 44 Z"/>
+                            <polyline points="36,4 36,8 40,8"/>
+                        </svg>
+                        <p>No notes yet</p>
+                        <p class="empty-hint">Use transforms to generate notes from sources</p>
+                    </div>
+                `;
+                return;
+            }
+
+            container.innerHTML = '';
+
+            notes.forEach(note => {
+                const clone = template.content.cloneNode(true);
+                const item = clone.querySelector('.note-item');
+
+                item.dataset.id = note.id;
+                item.querySelector('.note-type-badge').textContent = this.noteTypeNameMap[note.type] || note.type.toUpperCase();
+                item.querySelector('.note-title').textContent = note.title;
+
+                const plainText = note.content
+                    .replace(/^#+\s+/gm, '')
+                    .replace(/\*\*/g, '')
+                    .replace(/\*/g, '')
+                    .replace(/`/g, '')
+                    .replace(/\ \[([^\]]+)\]\([^)]+\)/g, '$1')
+                    .replace(/\n+/g, ' ')
+                    .trim();
+
+                item.querySelector('.note-preview').textContent = plainText;
+                item.querySelector('.note-date').textContent = this.formatDate(note.created_at);
+                item.querySelector('.note-sources').textContent = `${note.source_ids?.length || 0} sources`;
+
+                const deleteBtn = item.querySelector('.btn-delete-note');
+                deleteBtn.addEventListener('click', () => {
+                    this.deleteNote(note.id);
+                });
+
+                item.addEventListener('click', (e) => {
+                    if (!e.target.closest('.btn-delete-note')) {
+                        this.viewNote(note);
+                    }
+                });
+
+                container.appendChild(clone);
+            });
+
+            this.updateFooter();
+        } catch (error) {
+            console.error('Failed to load notes:', error);
+        }
+    }
+
+    async viewNote(note) {
+        // Debug: log note metadata
+        console.log('viewNote - metadata:', note.metadata);
+        console.log('viewNote - image_url:', note.metadata?.image_url);
+        console.log('viewNote - currentPublicToken:', this.currentPublicToken);
+
+        // Rewrite image URLs for public notebooks
+        const content = this.rewriteImageUrlsForPublic(note.content);
+        const renderedContent = marked.parse(content);
+
+        // 信息图错误提示 HTML
+        let infographicErrorHTML = '';
+        if (note.type === 'infograph' && note.metadata?.image_error) {
+            const fullPrompt = note.content + '\n\n**Note: Please generate the output in English.**';
+            const escapedPrompt = this.escapeHtml(fullPrompt);
+            const escapedError = this.escapeHtml(note.metadata.image_error);
+
+            infographicErrorHTML = `
+                <div class="infographic-error-banner">
+                    <div class="error-banner-content">
+                        <svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2">
+                            <circle cx="10" cy="10" r="8"/>
+                            <line x1="10" y1="7" x2="10" y2="13"/>
+                            <line x1="10" y1="16" x2="10" y2="16"/>
+                        </svg>
+                        <div>
+                            <strong>Image generation failed</strong>
+                            <p>${escapedError}</p>
+                        </div>
+                    </div>
+                    <div class="error-banner-prompt">
+                        <strong>Generated prompt (for manual generation):</strong>
+                        <pre>${escapedPrompt}</pre>
+                    </div>
+                </div>
+            `;
+        }
+
+        // Rewrite image URL for infographics if present
+        const originalImageUrl = note.metadata?.image_url || null;
+        const infographicImageUrl = originalImageUrl
+            ? this.rewriteImageUrlsForPublic(originalImageUrl)
+            : null;
+
+        console.log('viewNote - originalImageUrl:', originalImageUrl);
+        console.log('viewNote - infographicImageUrl:', infographicImageUrl);
+
+        const infographicHTML = infographicImageUrl
+            ? `<div class="infographic-container">
+                 <img src="${infographicImageUrl}" alt="Infographic" class="infographic-image" onerror="console.error('Failed to load image:', this.src)">
+                 <div class="infographic-actions">
+                    <a href="${infographicImageUrl}" target="_blank" class="btn-text">View full image</a>
+                 </div>
+               </div>`
+            : '';
+
+        // PPT Slider HTML
+        let pptSliderHTML = '';
+        if (note.metadata?.slides && note.metadata.slides.length > 0) {
+            const slides = note.metadata.slides.map(src => {
+                const rewritten = this.rewriteImageUrlsForPublic(src);
+                console.log('viewNote - slide original:', src, 'rewritten:', rewritten);
+                return rewritten;
+            });
+            pptSliderHTML = `
+                <div class="ppt-viewer-container" id="pptViewer">
+                    <div class="ppt-slides-wrapper">
+                        ${slides.map((src, index) => `
+                            <div class="ppt-slide ${index === 0 ? 'active' : ''}" data-index="${index}">
+                                <img src="${src}" alt="Slide ${index + 1}" onerror="console.error('Failed to load slide:', this.src)">
+                                <div class="ppt-slide-counter">${index + 1} / ${slides.length}</div>
+                            </div>
+                        `).join('')}
+                    </div>
+                    <div class="ppt-controls">
+                        <button class="btn-ppt-nav prev" id="btnPptPrev">
+                            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="15 18 9 12 15 6"></polyline></svg>
+                        </button>
+                        <button class="btn-ppt-nav next" id="btnPptNext">
+                            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 18 15 12 9 6"></polyline></svg>
+                        </button>
+                    </div>
+                </div>
+            `;
+        }
+
+        // Determine if we should show the text content
+        const showMarkdownContent = (note.type !== 'infograph' && note.type !== 'ppt') || (!note.metadata?.image_url && !note.metadata?.slides);
+
+        // Show the Note tab button
+        const tabBtnNote = document.getElementById('tabBtnNote');
+        if (tabBtnNote) {
+            tabBtnNote.style.display = 'flex';
+        }
+
+        // Remove existing note view if any
+        const existingNoteView = document.querySelector('.note-view-container');
+        if (existingNoteView) {
+            existingNoteView.remove();
+        }
+
+        // Create note view container and insert it after chat-messages-wrapper
+        const noteViewHTML = `
+            <div class="note-view-container">
+                <div class="note-view-header">
+                    <div class="note-view-info">
+                        <span class="note-view-type">${note.type}</span>
+                        <span class="note-view-title-text">${note.title}</span>
+                    </div>
+                    <div class="note-view-actions">
+                        <button class="btn-copy-note" id="btnCopyNote" title="Copy Markdown">
+                            <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2">
+                                <rect x="3" y="3" width="10" height="10" rx="1"/>
+                                <path d="M7 3 L7 1 C7 1 13 1 13 1 L13 13 L11 13"/>
+                            </svg>
+                        </button>
+                    </div>
+                </div>
+                <div class="note-view-content">
+                    ${infographicErrorHTML}
+                    ${infographicHTML}
+                    ${pptSliderHTML}
+                    <div class="markdown-content" style="${showMarkdownContent ? '' : 'display:none'}">${renderedContent}</div>
+                </div>
+            </div>
+        `;
+
+        const chatWrapper = document.querySelector('.chat-messages-wrapper');
+        chatWrapper.insertAdjacentHTML('afterend', noteViewHTML);
+
+        // PPT Navigation Logic
+        if (note.metadata?.slides) {
+            let currentSlide = 0;
+            const slidesCount = note.metadata.slides.length;
+            const slideElements = document.querySelectorAll('.ppt-slide');
+            
+            const showSlide = (n) => {
+                slideElements[currentSlide].classList.remove('active');
+                currentSlide = (n + slidesCount) % slidesCount;
+                slideElements[currentSlide].classList.add('active');
+            };
+
+            document.getElementById('btnPptPrev').addEventListener('click', () => showSlide(currentSlide - 1));
+            document.getElementById('btnPptNext').addEventListener('click', () => showSlide(currentSlide + 1));
+            
+            // Key navigation
+            const keyHandler = (e) => {
+                if (e.key === 'ArrowLeft') showSlide(currentSlide - 1);
+                if (e.key === 'ArrowRight') showSlide(currentSlide + 1);
+            };
+            document.addEventListener('keydown', keyHandler);
+            // Cleanup handler on container remove? We'll leave it for now or add observer
+        }
+
+        // Render Mermaid diagrams if any
+        if (window.mermaid) {
+            try {
+                mermaid.initialize({ 
+                    startOnLoad: false, 
+                    theme: 'base',
+                    securityLevel: 'loose',
+                    fontFamily: 'var(--font-sans)',
+                    themeVariables: {
+                        // Vibrant WeChat Green Theme
+                        primaryColor: '#ecfdf5', // Lighter, more vibrant green background
+                        primaryTextColor: '#065f46', // Deep emerald for text
+                        primaryBorderColor: '#10b981', // Bright emerald border
+                        lineColor: '#10b981', // Bright line color
+                        secondaryColor: '#f0fdf4',
+                        tertiaryColor: '#ffffff',
+                        fontSize: '14px',
+                        mainBkg: '#ecfdf5',
+                        nodeBorder: '#10b981',
+                        clusterBkg: '#f0fdf4',
+                        // Mindmap specific vibrancy
+                        nodeTextColor: '#065f46',
+                        edgeColor: '#34d399' // Slightly lighter green for edges
+                    },
+                    mindmap: {
+                        useMaxWidth: true,
+                        padding: 20
+                    }
+                });
+                
+                const contentArea = document.querySelector('.note-view-content');
+                const mermaidBlocks = contentArea.querySelectorAll('pre code.language-mermaid');
+                
+                // Helper to fix common mermaid errors
+                const sanitizeMermaid = (code) => {
+                    let sanitized = code.trim();
+
+                    // 1. If it's a graph and has unquoted brackets, try to wrap them
+                    if (sanitized.startsWith('graph')) {
+                        // Fix things like: A --> socket() --> B
+                        sanitized = sanitized.replace(/(\s+)-->(\s+)([^"\s][^-\n>]*\([^)]*\)[^-\n>]*)/g, '$1-->$2"$3"');
+                        sanitized = sanitized.replace(/([^"\s][^-\n>]*\([^)]*\)[^-\n>]*)\s+-->/g, '"$1" -->');
+                    }
+
+                    // 2. Fix mindmap - handle special characters in node labels
+                    if (sanitized.startsWith('mindmap')) {
+                        const lines = sanitized.split('\n');
+                        const processedLines = [];
+
+                        for (let i = 0; i < lines.length; i++) {
+                            let line = lines[i];
+                            const trimmed = line.trim();
+
+                            // Skip empty lines and the mindmap declaration
+                            if (!trimmed || trimmed === 'mindmap') {
+                                processedLines.push(line);
+                                continue;
+                            }
+
+                            // Fix root if missing double parens
+                            if (trimmed.startsWith('root') && !line.includes('((')) {
+                                line = line.replace(/root\s+(.+)/, 'root(($1))');
+                                processedLines.push(line);
+                                continue;
+                            }
+
+                            // For other nodes, check if they contain special characters that need quoting
+                            // Special chars: parentheses, brackets, braces, quotes, colons, semicolons
+                            const hasSpecialChars = /[\(\)\[\]\{\}"':;,\s]{2,}/.test(trimmed);
+                            const alreadyQuoted = /^["'].*["']$/.test(trimmed) || /^\(.*\)$/.test(trimmed) || /^\[.*\]$/.test(trimmed);
+
+                            if (hasSpecialChars && !alreadyQuoted && trimmed.length > 0) {
+                                // Extract indentation and node content
+                                const indentMatch = line.match(/^(\s*)/);
+                                const indent = indentMatch ? indentMatch[1] : '';
+                                const content = trimmed;
+
+                                // Wrap in quotes and preserve the original brackets for styling
+                                // Replace inner parentheses that are part of the content with quoted version
+                                processedLines.push(indent + '"' + content.replace(/"/g, '\\"') + '"');
+                            } else {
+                                processedLines.push(line);
+                            }
+                        }
+
+                        sanitized = processedLines.join('\n');
+                    }
+
+                    return sanitized;
+                };
+
+                for (let i = 0; i < mermaidBlocks.length; i++) {
+                    const block = mermaidBlocks[i];
+                    const pre = block.parentElement;
+                    const rawCode = block.textContent;
+                    const cleanCode = sanitizeMermaid(rawCode);
+                    
+                    const id = `mermaid-diag-${Date.now()}-${i}`;
+                    
+                    try {
+                        const { svg } = await mermaid.render(id, cleanCode);
+                        const container = document.createElement('div');
+                        container.className = 'mermaid-diagram';
+                        container.innerHTML = svg;
+                        pre.parentNode.replaceChild(container, pre);
+                    } catch (renderErr) {
+                        console.error('Mermaid Render Error:', renderErr);
+                        // Final fallback: If rendering failed, try one more time by stripping ALL parentheses from labels
+                        try {
+                            const lastResort = cleanCode.replace(/\(|\)/g, '');
+                            const { svg } = await mermaid.render(`${id}-retry`, lastResort);
+                            const container = document.createElement('div');
+                            container.className = 'mermaid-diagram';
+                            container.innerHTML = svg;
+                            pre.parentNode.replaceChild(container, pre);
+                        } catch (e) {
+                            pre.innerHTML = `<div style="color:red; font-size:12px; padding:10px;">Render failed: ${renderErr.message}</div>`;
+                        }
+                    }
+                }
+            } catch (err) {
+                console.error('Mermaid general error:', err);
+            }
+        }
+
+        // Render MathJax if available
+        if (window.MathJax && window.MathJax.typesetPromise) {
+            try {
+                await MathJax.typesetPromise([document.querySelector('.note-view-content')]);
+            } catch (e) {
+                console.warn('MathJax rendering error:', e);
+            }
+        }
+
+        // Render ECharts if note type is data_chart
+        if (note.type === 'data_chart') {
+            try {
+                const contentArea = document.querySelector('.note-view-content');
+                const markdownContent = document.querySelector('.markdown-content');
+
+                // Try to parse the note content as JSON for chart options
+                let charts = [];
+                try {
+                    // Check if content contains JSON array or object
+                    const jsonMatch = note.content.match(/(\[[\s\S]*\])|(\{[\s\S]*\})/);
+                    if (jsonMatch) {
+                        const parsed = JSON.parse(jsonMatch[0]);
+                        if (Array.isArray(parsed)) {
+                            // New format: array of {title, option}
+                            charts = parsed.map(item => ({
+                                title: item.title || '',
+                                option: item.option
+                            }));
+                        } else if (parsed.charts) {
+                            // Old format: {charts: [{title, option}]}
+                            charts = parsed.charts.map(item => ({
+                                title: item.title || '',
+                                option: item.option
+                            }));
+                        } else if (parsed.option) {
+                            // Single chart format: {option: {...}}
+                            charts = [{ title: '', option: parsed.option }];
+                        }
+                    }
+                } catch (e) {
+                    console.log('Failed to parse chart JSON:', e);
+                }
+
+                if (charts.length > 0) {
+                    // Create chart containers
+                    const chartContainer = document.createElement('div');
+                    chartContainer.className = 'charts-container';
+
+                    charts.forEach((chart, index) => {
+                        const chartWrapper = document.createElement('div');
+                        chartWrapper.className = 'chart-wrapper';
+
+                        const chartDiv = document.createElement('div');
+                        chartDiv.className = 'chart-div';
+                        chartDiv.id = `chart-${note.id}-${index}`;
+
+                        chartWrapper.appendChild(chartDiv);
+                        chartContainer.appendChild(chartWrapper);
+
+                        // Initialize ECharts
+                        const echartsInstance = echarts.init(chartDiv, {
+                            renderer: 'canvas',
+                            useDirtyRect: true
+                        });
+
+                        echartsInstance.setOption(chart.option);
+
+                        // Resize after 2 seconds to ensure proper display
+                        setTimeout(() => {
+                            echartsInstance.resize();
+                        }, 2000);
+
+                        // Responsive resize
+                        window.addEventListener('resize', () => {
+                            echartsInstance.resize();
+                        });
+                    });
+
+                    // Insert charts before markdown content
+                    contentArea.insertBefore(chartContainer, markdownContent);
+                    markdownContent.style.display = 'none';
+                }
+            } catch (error) {
+                console.error('Failed to render charts:', error);
+            }
+        }
+
+        // Switch to note tab
+        this.switchPanelTab('note');
+
+        // Copy button
+        const copyBtn = document.getElementById('btnCopyNote');
+        copyBtn.addEventListener('click', async () => {
+            try {
+                await navigator.clipboard.writeText(note.content);
+                const originalHTML = copyBtn.innerHTML;
+                copyBtn.innerHTML = `
+                    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2">
+                        <polyline points="4,8 6,10 12,4"/>
+                    </svg>
+                `;
+                copyBtn.classList.add('copied');
+                setTimeout(() => {
+                    copyBtn.innerHTML = originalHTML;
+                    copyBtn.classList.remove('copied');
+                }, 2000);
+                this.setStatus('Copied!');
+            } catch (err) {
+                this.showError('Copy failed');
+            }
+        });
+
+        // Highlight the selected note in the sidebar
+        document.querySelectorAll('.note-item').forEach(el => {
+            el.classList.remove('selected');
+        });
+        const noteItem = document.querySelector(`.note-item[data-id="${note.id}"]`);
+        if (noteItem) {
+            noteItem.classList.add('selected');
+        }
+    }
+
+    async deleteNote(id) {
+        // Immediately remove from UI
+        const noteCard = document.querySelector(`.compact-note-card[data-note-id="${id}"]`);
+        if (noteCard) {
+            noteCard.remove();
+        }
+
+        // Also remove from notes list sidebar
+        const noteItem = document.querySelector(`.note-item[data-id="${id}"]`);
+        if (noteItem) {
+            noteItem.remove();
+        }
+
+        try {
+            await this.api(`/notebooks/${this.currentNotebook.id}/notes/${id}`, {
+                method: 'DELETE',
+            });
+            await this.loadNotes();
+            await this.updateCurrentNotebookCounts();
+
+            // If notes_list tab is active or visible, refresh it
+            const tabBtnNotesList = document.getElementById('tabBtnNotesList');
+            if (tabBtnNotesList && !tabBtnNotesList.classList.contains('hidden')) {
+                this.renderNotesCompactGrid();
+            }
+        } catch (error) {
+            this.showError('Failed to delete note');
+            // Reload to restore if deletion failed
+            await this.loadNotes();
+            this.renderNotesCompactGrid();
+        }
+    }
+
+    // 转换方法
+    async handleTransform(type, element) {
+        if (!this.currentNotebook) {
+            this.showError('Please select a notebook first');
+            return;
+        }
+
+        const sources = await this.api(`/notebooks/${this.currentNotebook.id}/sources`);
+        if (sources.length === 0) {
+            this.showError('Please add sources first');
+            return;
+        }
+
+        const customPrompt = document.getElementById('customPrompt').value;
+        const typeName = this.noteTypeNameMap[type] || 'Content';
+
+        // 1. 开始动画
+        if (element) {
+            element.classList.add('loading');
+        }
+
+        // 2. 添加占位笔记
+        const notesContainer = document.getElementById('notesList');
+        const template = document.getElementById('noteTemplate');
+        const placeholder = template.content.cloneNode(true).querySelector('.note-item');
+        
+        placeholder.classList.add('placeholder');
+        placeholder.querySelector('.note-title').textContent = `Generating ${typeName}...`;
+        placeholder.querySelector('.note-preview').textContent = 'AI is analyzing your sources and writing notes...';
+        placeholder.querySelector('.note-date').textContent = 'Just now';
+        placeholder.querySelector('.note-type-badge').textContent = type.toUpperCase();
+        
+        // 占位符暂不显示删除按钮
+        const delBtn = placeholder.querySelector('.btn-delete-note');
+        if (delBtn) delBtn.style.display = 'none';
+        
+        // 如果有“暂无笔记”状态，先清空
+        const emptyState = notesContainer.querySelector('.empty-state');
+        if (emptyState) emptyState.remove();
+        
+        notesContainer.prepend(placeholder);
+        placeholder.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+
+        // For large documents the summarisation can take minutes.
+        // Update the placeholder periodically so the user knows it is working.
+        let transformTimer = null;
+        let elapsed = 0;
+        transformTimer = setInterval(() => {
+            elapsed += 10;
+            if (elapsed >= 30) {
+                placeholder.querySelector('.note-preview').textContent =
+                    `Large document \u2014 summarising (${elapsed}s elapsed)...`;
+            }
+        }, 10000);
+
+        try {
+            const sourceIds = sources.map(s => s.id);
+            const note = await this.api(`/notebooks/${this.currentNotebook.id}/transform`, {
+                method: 'POST',
+                body: JSON.stringify({
+                    type: type,
+                    prompt: customPrompt || undefined,
+                    source_ids: sourceIds,
+                    length: 'medium',
+                    format: 'markdown',
+                }),
+            });
+
+            // 3. 停止动画并更新占位符
+            clearInterval(transformTimer);
+            if (element) element.classList.remove('loading');
+
+            // 替换占位符内容
+            placeholder.classList.remove('placeholder');
+            placeholder.dataset.id = note.id;
+            placeholder.querySelector('.note-title').textContent = note.title;
+            
+            const plainText = note.content
+                .replace(/^#+\s+/gm, '')
+                .replace(/\*\*/g, '')
+                .replace(/\*/g, '')
+                .replace(/`/g, '')
+                .replace(/\ \[([^\]]+)\]\([^)]+\)/g, '$1')
+                .replace(/\n+/g, ' ')
+                .trim();
+            
+            placeholder.querySelector('.note-preview').textContent = plainText;
+            placeholder.querySelector('.note-sources').textContent = `${note.source_ids?.length || 0} sources`;
+
+            // 恢复删除按钮并绑定事件
+            if (delBtn) {
+                delBtn.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    this.deleteNote(note.id);
+                });
+            }
+
+            // 绑定查看事件
+            placeholder.addEventListener('click', (e) => {
+                if (!e.target.closest('.btn-delete-note')) {
+                    this.viewNote(note);
+                }
+            });
+
+            await this.updateCurrentNotebookCounts();
+            this.updateFooter();
+            document.getElementById('customPrompt').value = '';
+
+            this.setStatus(`Generated ${typeName} successfully`);
+
+            // If notes_list tab is active or visible, refresh it
+            const tabBtnNotesList = document.getElementById('tabBtnNotesList');
+            if (tabBtnNotesList && !tabBtnNotesList.classList.contains('hidden')) {
+                this.renderNotesCompactGrid();
+            }
+        } catch (error) {
+            clearInterval(transformTimer);
+            if (element) element.classList.remove('loading');
+            placeholder.remove(); // 失败则移除占位符
+            this.showError(error.message);
+        }
+    }
+
+    // 聊天方法
+    async loadChatSessions() {
+        if (!this.currentNotebook) return;
+
+        try {
+            await this.api(`/notebooks/${this.currentNotebook.id}/chat/sessions`);
+            const container = document.getElementById('chatMessages');
+            container.innerHTML = `
+                <div class="chat-welcome">
+                    <svg width="40" height="40" viewBox="0 0 40 40" fill="none" stroke="currentColor" stroke-width="1.5">
+                        <circle cx="20" cy="12" r="6"/>
+                        <path d="M8 38 C8 28 14 22 20 22 C26 22 32 28 32 38"/>
+                    </svg>
+                    <h3>Chat with sources</h3>
+                    <p>Ask questions about your notebook content</p>
+                </div>
+            `;
+            this.currentChatSession = null;
+        } catch (error) {
+            console.error('Failed to load chat:', error);
+        }
+    }
+
+    async handleChat(e) {
+        e.preventDefault();
+
+        if (!this.currentNotebook) {
+            this.showError('Please select a notebook first');
+            return;
+        }
+
+        const input = document.getElementById('chatInput');
+        const message = input.value.trim();
+
+        if (!message) return;
+
+        this.addMessage('user', message);
+        input.value = '';
+
+        const sources = await this.api(`/notebooks/${this.currentNotebook.id}/sources`);
+        if (sources.length === 0) {
+            this.addMessage('assistant', 'Please add some sources to this notebook first.');
+            return;
+        }
+
+        this.setStatus('Thinking...');
+
+        // Show a more informative message if this is the first chat
+        // in this session (vector index cold-start may take a few seconds).
+        let statusTimer = null;
+        statusTimer = setTimeout(() => {
+            this.setStatus('Preparing document index...');
+        }, 4000);
+
+        try {
+            const response = await this.api(`/notebooks/${this.currentNotebook.id}/chat`, {
+                method: 'POST',
+                body: JSON.stringify({
+                    message: message,
+                    session_id: this.currentChatSession || undefined,
+                }),
+            });
+
+            clearTimeout(statusTimer);
+            this.addMessage('assistant', response.message, response.sources);
+            this.currentChatSession = response.session_id;
+            this.setStatus('Ready');
+        } catch (error) {
+            clearTimeout(statusTimer);
+            this.addMessage('assistant', `Error: ${error.message}`);
+            this.setStatus('Error');
+        }
+    }
+
+    addMessage(role, content, sources = []) {
+        const container = document.getElementById('chatMessages');
+        const template = document.getElementById('messageTemplate');
+
+        const welcome = container.querySelector('.chat-welcome');
+        if (welcome) welcome.remove();
+
+        const clone = template.content.cloneNode(true);
+        const message = clone.querySelector('.chat-message');
+
+        message.dataset.role = role;
+        
+        const avatar = message.querySelector('.message-avatar');
+        avatar.textContent = role === 'assistant' ? 'AI' : 'You';
+
+        const messageText = message.querySelector('.message-text');
+        if (role === 'assistant') {
+            messageText.innerHTML = marked.parse(content);
+        } else {
+            messageText.textContent = content;
+        }
+
+        if (sources.length > 0) {
+            const sourcesContainer = message.querySelector('.message-sources');
+            sources.forEach(source => {
+                const tag = document.createElement('span');
+                tag.className = 'source-tag';
+                tag.textContent = source.name || source.id;
+                sourcesContainer.appendChild(tag);
+            });
+        }
+
+        container.appendChild(clone);
+
+        // Render MathJax for the new message if available
+        if (window.MathJax && window.MathJax.typesetPromise && role === 'assistant') {
+            MathJax.typesetPromise([messageText]).catch(err => {
+                console.warn('MathJax rendering error:', err);
+            });
+        }
+
+        container.scrollTop = container.scrollHeight;
+    }
+
+    // UI 方法
+    closeModals() {
+        document.querySelectorAll('.modal').forEach(m => m.classList.remove('active'));
+        document.getElementById('modalOverlay').classList.remove('active');
+        this.hideLoading();
+    }
+
+    showLoading(text) {
+        document.getElementById('loadingText').textContent = text || 'Processing...';
+        document.getElementById('loadingOverlay').classList.add('active');
+    }
+
+    hideLoading() {
+        document.getElementById('loadingOverlay').classList.remove('active');
+    }
+
+    setStatus(text) {
+        document.getElementById('footerStatus').textContent = text;
+    }
+
+    // 工具方法：转义 HTML 特殊字符
+    escapeHtml(text) {
+        const div = document.createElement('div');
+        div.textContent = text;
+        return div.innerHTML;
+    }
+
+    // Rewrite image URLs for public notebooks
+    // No longer needed - backend handles access control based on notebook public status
+    rewriteImageUrlsForPublic(content) {
+        // Keep original URLs - backend will handle access control
+        return content;
+    }
+
+    // 通用 toast 提示方法
+    showToast(message, type = 'error') {
+        const colors = {
+            error: 'var(--accent-red)',
+            warn: 'var(--accent-orange)',
+            success: 'var(--accent-green)'
+        };
+
+        const toast = document.createElement('div');
+        toast.className = `${type}-toast`;
+        toast.style.cssText = `
+            position: fixed; bottom: 60px; right: 20px; padding: 12px 20px;
+            background: ${colors[type]}; color: white; font-family: var(--font-mono);
+            font-size: 0.75rem; border-radius: 4px; box-shadow: var(--shadow-medium);
+            animation: slideIn 0.3s ease; z-index: 3000; white-space: pre-wrap; max-width: 400px;
+        `;
+        toast.textContent = message;
+        document.body.appendChild(toast);
+
+        setTimeout(() => {
+            toast.style.opacity = '0';
+            setTimeout(() => toast.remove(), 300);
+        }, 5000);
+    }
+
+    showError(message) {
+        this.setStatus(`Error: ${message}`);
+        this.showToast(message, 'error');
+    }
+
+    showWarn(message) {
+        this.showToast(message, 'warn');
+    }
+
+    updateFooter() {
+        const sourceCount = document.querySelectorAll('.source-card').length;
+        const noteCount = document.querySelectorAll('.note-item').length;
+        document.getElementById('footerStats').textContent = `${sourceCount} sources · ${noteCount} notes`;
+    }
+
+    formatDate(dateString) {
+        const date = new Date(dateString);
+        const now = new Date();
+        const diff = now - date;
+
+        if (diff < 60000) return 'Just now';
+        if (diff < 3600000) return `${Math.floor(diff / 60000)}m ago`;
+        if (diff < 86400000) return `${Math.floor(diff / 3600000)}h ago`;
+
+        return date.toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' });
+    }
+
+    async updateCurrentNotebookCounts() {
+        if (!this.currentNotebook) return;
+
+        const [sources, notes] = await Promise.all([
+            this.api(`/notebooks/${this.currentNotebook.id}/sources`),
+            this.api(`/notebooks/${this.currentNotebook.id}/notes`)
+        ]);
+
+        const notebookCard = document.querySelector(`.notebook-card[data-id="${this.currentNotebook.id}"]`);
+        if (notebookCard) {
+            notebookCard.querySelector('.stat-sources').textContent = `${sources.length} sources`;
+            notebookCard.querySelector('.stat-notes').textContent = `${notes.length} notes`;
+        }
+    }
+}
+
+// 初始化
+document.addEventListener('DOMContentLoaded', () => {
+    window.app = new OpenNotebook();
+});
